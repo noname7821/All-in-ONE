@@ -1,13 +1,11 @@
--- Lemming v2: Game File Ripper for Delta Executor (Mobile + PC)
--- Fixed: Freeze at "Grabbing Scripts" | Export via clipboard + base64 decode
--- No writefile permission needed. Uses setclipboard + external decoder.
+-- Lemming v3: All parts copied at once via single concatenated clipboard string
+-- Uses a delimiter system. Decoder splits automatically.
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 local screenSize = workspace.CurrentCamera.ViewportSize
@@ -17,7 +15,7 @@ if syn and syn.protect_gui then
     syn.protect_gui(CoreGui)
 end
 
--- Base64 encoder (pure Lua, no external deps)
+-- Base64 encoder
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local function base64Encode(data)
     local bytes = {}
@@ -50,36 +48,13 @@ local function base64Encode(data)
     return table.concat(result)
 end
 
--- Chunked clipboard for large files (splits >2MB into multiple clipboard sets)
-local function setLargeClipboard(data)
-    local chunks = {}
-    local chunkSize = 1800000 -- 1.8MB per chunk (safe limit for mobile)
-    local totalLen = #data
-    for i = 1, totalLen, chunkSize do
-        local chunk = string.sub(data, i, math.min(i + chunkSize - 1, totalLen))
-        table.insert(chunks, chunk)
-    end
-    if #chunks == 1 then
-        setclipboard(chunks[1])
-        return 1
-    else
-        local manifest = "LEMMING_SPLIT:" .. #chunks .. ":" .. totalLen .. "|"
-        for i, chunk in ipairs(chunks) do
-            if i == 1 then
-                setclipboard(manifest .. chunk)
-            end
-        end
-        return #chunks
-    end
-end
-
 local SETTINGS = {
     Accent = Color3.fromRGB(0, 255, 140),
     Background = Color3.fromRGB(25, 25, 30),
     Secondary = Color3.fromRGB(35, 35, 40),
     Text = Color3.fromRGB(220, 220, 220),
-    BatchSize = 50, -- Process objects in batches to prevent freeze
-    BatchDelay = 0.05, -- Seconds between batches
+    BatchSize = 15,
+    BatchDelay = 0.03,
 }
 
 local copiedData = {
@@ -88,7 +63,6 @@ local copiedData = {
     Metadata = {}
 }
 
--- Recursive copy with depth guard
 local function recursiveCopy(instance, depth)
     depth = depth or 0
     if depth > 200 then return nil end
@@ -123,44 +97,16 @@ local function recursiveCopy(instance, depth)
             end
         end)
     end
-    if SETTINGS.GrabInstances ~= false then
-        for _, child in pairs(instance:GetChildren()) do
-            local childData = recursiveCopy(child, depth + 1)
-            if childData then
-                table.insert(data.Children, childData)
-            end
+    for _, child in pairs(instance:GetChildren()) do
+        local childData = recursiveCopy(child, depth + 1)
+        if childData then
+            table.insert(data.Children, childData)
         end
     end
     return data
 end
 
--- Batch processor to prevent freezing
-local function processBatch(items, startIdx, batchSize, callback)
-    local total = #items
-    local idx = startIdx or 1
-    spawn(function()
-        while idx <= total do
-            local batchEnd = math.min(idx + batchSize - 1, total)
-            for i = idx, batchEnd do
-                local success, err = pcall(callback, items[i], i, total)
-                if not success then
-                    -- Silently skip problematic objects
-                end
-            end
-            idx = batchEnd + 1
-            if idx <= total then
-                local progress = idx / total
-                pcall(function()
-                    ui.ProgFill:TweenSize(UDim2.new(progress, 0, 1, 0), "Out", "Quad", 0.1, true)
-                end)
-                wait(SETTINGS.BatchDelay)
-            end
-        end
-    end)
-    return total
-end
-
--- Mobile-optimized Circle UI
+-- UI
 local function createMobileCircleUI()
     local screen = Instance.new("ScreenGui")
     screen.Name = "LemmingUI"
@@ -170,7 +116,7 @@ local function createMobileCircleUI()
     screen.IgnoreGuiInset = true
 
     local w = math.floor(340 * scaleFactor)
-    local h = math.floor(540 * scaleFactor)
+    local h = math.floor(500 * scaleFactor)
     local circleSize = math.floor(130 * scaleFactor)
     local fontSize = math.floor(16 * scaleFactor)
     local smallFont = math.floor(12 * scaleFactor)
@@ -184,10 +130,7 @@ local function createMobileCircleUI()
     mainFrame.BackgroundTransparency = 0.1
     mainFrame.BorderSizePixel = 0
     mainFrame.Parent = screen
-
-    local circleCorner = Instance.new("UICorner")
-    circleCorner.CornerRadius = UDim.new(0, math.floor(22 * scaleFactor))
-    circleCorner.Parent = mainFrame
+    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, math.floor(22 * scaleFactor))
 
     -- Title bar
     local titleBar = Instance.new("Frame")
@@ -195,30 +138,25 @@ local function createMobileCircleUI()
     titleBar.BackgroundColor3 = SETTINGS.Secondary
     titleBar.BorderSizePixel = 0
     titleBar.Parent = mainFrame
-
-    local titleCorner = Instance.new("UICorner")
-    titleCorner.CornerRadius = UDim.new(0, math.floor(22 * scaleFactor))
-    titleCorner.Parent = titleBar
-
-    local titlePatch = Instance.new("Frame")
-    titlePatch.Size = UDim2.new(1, 0, 0.5, 0)
-    titlePatch.Position = UDim2.new(0, 0, 0.5, 0)
-    titlePatch.BackgroundColor3 = SETTINGS.Secondary
-    titlePatch.BorderSizePixel = 0
-    titlePatch.Parent = titleBar
+    local tc = Instance.new("UICorner", titleBar)
+    tc.CornerRadius = UDim.new(0, math.floor(22 * scaleFactor))
+    local tp = Instance.new("Frame", titleBar)
+    tp.Size = UDim2.new(1, 0, 0.5, 0)
+    tp.Position = UDim2.new(0, 0, 0.5, 0)
+    tp.BackgroundColor3 = SETTINGS.Secondary
+    tp.BorderSizePixel = 0
 
     local titleText = Instance.new("TextLabel")
     titleText.Size = UDim2.new(1, -20, 1, 0)
     titleText.Position = UDim2.new(0, 10, 0, 0)
     titleText.BackgroundTransparency = 1
-    titleText.Text = "LEMMING v2"
+    titleText.Text = "LEMMING v3"
     titleText.TextColor3 = SETTINGS.Accent
     titleText.TextSize = math.floor(20 * scaleFactor)
     titleText.Font = Enum.Font.GothamBold
     titleText.TextXAlignment = Enum.TextXAlignment.Left
     titleText.Parent = titleBar
 
-    -- Touch drag
     local dragToggle = Instance.new("TextButton")
     dragToggle.Size = UDim2.new(1, 0, 1, 0)
     dragToggle.BackgroundTransparency = 1
@@ -244,14 +182,13 @@ local function createMobileCircleUI()
         end
     end)
 
-    -- Circle button container
+    -- Circle container
     local circleContainer = Instance.new("Frame")
     circleContainer.Size = UDim2.new(1, 0, 0, math.floor(200 * scaleFactor))
     circleContainer.Position = UDim2.new(0, 0, 0, math.floor(60 * scaleFactor))
     circleContainer.BackgroundTransparency = 1
     circleContainer.Parent = mainFrame
 
-    -- Main circle button
     local startButton = Instance.new("TextButton")
     startButton.Size = UDim2.new(0, circleSize, 0, circleSize)
     startButton.Position = UDim2.new(0.5, -circleSize/2, 0, math.floor(5 * scaleFactor))
@@ -262,14 +199,10 @@ local function createMobileCircleUI()
     startButton.Font = Enum.Font.GothamBold
     startButton.BorderSizePixel = 0
     startButton.Parent = circleContainer
+    Instance.new("UICorner", startButton).CornerRadius = UDim.new(1, 0)
 
-    local circleCorner2 = Instance.new("UICorner")
-    circleCorner2.CornerRadius = UDim.new(1, 0)
-    circleCorner2.Parent = startButton
-
-    -- Pulse
-    local pulseFrame = Instance.new("Frame")
     local pulseBase = circleSize + math.floor(20 * scaleFactor)
+    local pulseFrame = Instance.new("Frame")
     pulseFrame.Size = UDim2.new(0, pulseBase, 0, pulseBase)
     pulseFrame.Position = UDim2.new(0.5, -pulseBase/2, 0, -math.floor(8 * scaleFactor))
     pulseFrame.BackgroundColor3 = SETTINGS.Accent
@@ -277,10 +210,7 @@ local function createMobileCircleUI()
     pulseFrame.BorderSizePixel = 0
     pulseFrame.ZIndex = 0
     pulseFrame.Parent = circleContainer
-
-    local pulseCorner = Instance.new("UICorner")
-    pulseCorner.CornerRadius = UDim.new(1, 0)
-    pulseCorner.Parent = pulseFrame
+    Instance.new("UICorner", pulseFrame).CornerRadius = UDim.new(1, 0)
 
     spawn(function()
         local expandSize = pulseBase + math.floor(25 * scaleFactor)
@@ -294,7 +224,6 @@ local function createMobileCircleUI()
         end
     end)
 
-    -- Status Text
     local statusText = Instance.new("TextLabel")
     statusText.Size = UDim2.new(1, -20, 0, math.floor(22 * scaleFactor))
     statusText.Position = UDim2.new(0, 10, 0, circleSize + math.floor(18 * scaleFactor))
@@ -305,7 +234,6 @@ local function createMobileCircleUI()
     statusText.Font = Enum.Font.Gotham
     statusText.Parent = circleContainer
 
-    -- Progress bar
     local progFrame = Instance.new("Frame")
     progFrame.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(5 * scaleFactor))
     progFrame.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, circleSize + math.floor(46 * scaleFactor))
@@ -313,9 +241,7 @@ local function createMobileCircleUI()
     progFrame.BorderSizePixel = 0
     progFrame.Visible = false
     progFrame.Parent = circleContainer
-    local progCorner = Instance.new("UICorner")
-    progCorner.CornerRadius = UDim.new(1, 0)
-    progCorner.Parent = progFrame
+    Instance.new("UICorner", progFrame).CornerRadius = UDim.new(1, 0)
 
     local progFill = Instance.new("Frame")
     progFill.Size = UDim2.new(0, 0, 1, 0)
@@ -323,28 +249,22 @@ local function createMobileCircleUI()
     progFill.BorderSizePixel = 0
     progFill.Name = "Fill"
     progFill.Parent = progFrame
-    local fillCorner = Instance.new("UICorner")
-    fillCorner.CornerRadius = UDim.new(1, 0)
-    fillCorner.Parent = progFill
+    Instance.new("UICorner", progFill).CornerRadius = UDim.new(1, 0)
 
-    -- Info panel
     local infoFrame = Instance.new("Frame")
-    infoFrame.Size = UDim2.new(1, -math.floor(20 * scaleFactor), 0, math.floor(90 * scaleFactor))
-    infoFrame.Position = UDim2.new(0, math.floor(10 * scaleFactor), 0, math.floor(275 * scaleFactor))
+    infoFrame.Size = UDim2.new(1, -math.floor(20 * scaleFactor), 0, math.floor(70 * scaleFactor))
+    infoFrame.Position = UDim2.new(0, math.floor(10 * scaleFactor), 0, math.floor(270 * scaleFactor))
     infoFrame.BackgroundColor3 = SETTINGS.Secondary
     infoFrame.BackgroundTransparency = 0.3
     infoFrame.BorderSizePixel = 0
     infoFrame.Parent = mainFrame
-
-    local infoCorner = Instance.new("UICorner")
-    infoCorner.CornerRadius = UDim.new(0, math.floor(12 * scaleFactor))
-    infoCorner.Parent = infoFrame
+    Instance.new("UICorner", infoFrame).CornerRadius = UDim.new(0, math.floor(12 * scaleFactor))
 
     local infoText = Instance.new("TextLabel")
     infoText.Size = UDim2.new(1, -math.floor(16 * scaleFactor), 1, -math.floor(8 * scaleFactor))
     infoText.Position = UDim2.new(0, math.floor(8 * scaleFactor), 0, math.floor(4 * scaleFactor))
     infoText.BackgroundTransparency = 1
-    infoText.Text = "Place: " .. game.PlaceId .. "\nGame: " .. game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name
+    infoText.Text = "Place: " .. game.PlaceId
     infoText.TextColor3 = SETTINGS.Text
     infoText.TextSize = tinyFont
     infoText.Font = Enum.Font.Gotham
@@ -353,12 +273,11 @@ local function createMobileCircleUI()
     infoText.TextWrapped = true
     infoText.Parent = infoFrame
 
-    -- Export Buttons (multiple methods)
     local exportBtn1 = Instance.new("TextButton")
-    exportBtn1.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(36 * scaleFactor))
-    exportBtn1.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(378 * scaleFactor))
+    exportBtn1.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(40 * scaleFactor))
+    exportBtn1.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(350 * scaleFactor))
     exportBtn1.BackgroundColor3 = SETTINGS.Accent
-    exportBtn1.Text = "COPY TO CLIPBOARD"
+    exportBtn1.Text = "COPY ALL TO CLIPBOARD"
     exportBtn1.TextColor3 = Color3.fromRGB(15, 15, 20)
     exportBtn1.TextSize = smallFont
     exportBtn1.Font = Enum.Font.GothamBold
@@ -366,16 +285,13 @@ local function createMobileCircleUI()
     exportBtn1.Visible = false
     exportBtn1.Name = "ExportBtn1"
     exportBtn1.Parent = mainFrame
-
-    local exportCorner1 = Instance.new("UICorner")
-    exportCorner1.CornerRadius = UDim.new(0, math.floor(14 * scaleFactor))
-    exportCorner1.Parent = exportBtn1
+    Instance.new("UICorner", exportBtn1).CornerRadius = UDim.new(0, math.floor(14 * scaleFactor))
 
     local exportBtn2 = Instance.new("TextButton")
-    exportBtn2.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(36 * scaleFactor))
-    exportBtn2.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(420 * scaleFactor))
+    exportBtn2.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(40 * scaleFactor))
+    exportBtn2.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(398 * scaleFactor))
     exportBtn2.BackgroundColor3 = SETTINGS.Secondary
-    exportBtn2.Text = "SHOW DECODE LINK"
+    exportBtn2.Text = "SHOW DECODER"
     exportBtn2.TextColor3 = SETTINGS.Text
     exportBtn2.TextSize = smallFont
     exportBtn2.Font = Enum.Font.GothamBold
@@ -383,28 +299,13 @@ local function createMobileCircleUI()
     exportBtn2.Visible = false
     exportBtn2.Name = "ExportBtn2"
     exportBtn2.Parent = mainFrame
+    Instance.new("UICorner", exportBtn2).CornerRadius = UDim.new(0, math.floor(14 * scaleFactor))
 
-    local exportCorner2 = Instance.new("UICorner")
-    exportCorner2.CornerRadius = UDim.new(0, math.floor(14 * scaleFactor))
-    exportCorner2.Parent = exportBtn2
-
-    -- Method hint
-    local methodHint = Instance.new("TextLabel")
-    methodHint.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(30 * scaleFactor))
-    methodHint.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(460 * scaleFactor))
-    methodHint.BackgroundTransparency = 1
-    methodHint.Text = "Export: base64 → pastebin → decode → .rblxm"
-    methodHint.TextColor3 = Color3.fromRGB(130, 130, 140)
-    methodHint.TextSize = math.floor(8 * scaleFactor)
-    methodHint.Font = Enum.Font.Gotham
-    methodHint.Parent = mainFrame
-
-    -- Credit
     local creditText = Instance.new("TextLabel")
     creditText.Size = UDim2.new(1, -20, 0, math.floor(18 * scaleFactor))
     creditText.Position = UDim2.new(0, 10, 0, h - math.floor(22 * scaleFactor))
     creditText.BackgroundTransparency = 1
-    creditText.Text = "Lemming v2 | Clip Export"
+    creditText.Text = "Lemming v3 | One-Click Copy"
     creditText.TextColor3 = Color3.fromRGB(100, 100, 110)
     creditText.TextSize = math.floor(8 * scaleFactor)
     creditText.Font = Enum.Font.Gotham
@@ -429,7 +330,42 @@ local isRunning = false
 local currentB64Data = ""
 local currentFileName = ""
 
--- Non-blocking copy process using Heartbeat scheduling
+-- ============================================================
+-- FIX: Single clipboard set with ALL parts concatenated
+-- Uses delimiter |||LEMMING_SPLIT||| between parts
+-- Decoder splits on this delimiter and joins automatically
+-- ============================================================
+local function copyAllAtOnce(data, fileName)
+    local maxClipSize = 900000 -- Safe limit for all devices (900KB)
+    if #data <= maxClipSize then
+        -- Small enough, copy directly
+        setclipboard("LEMMING_SINGLE:" .. fileName .. "|" .. data)
+        return 1
+    end
+
+    -- Split into chunks with unified delimiter
+    local parts = {}
+    local chunkSize = maxClipSize
+    local totalLen = #data
+    local totalParts = math.ceil(totalLen / chunkSize)
+
+    for i = 1, totalParts do
+        local startIdx = (i-1)*chunkSize + 1
+        local endIdx = math.min(i*chunkSize, totalLen)
+        local chunk = string.sub(data, startIdx, endIdx)
+        table.insert(parts, "LEMMING_PART_" .. i .. "_OF_" .. totalParts .. "_" .. fileName)
+        table.insert(parts, chunk)
+    end
+
+    -- Join ALL parts with delimiter
+    local fullClipboard = table.concat(parts, "|||LEMMING_SPLIT|||")
+
+    -- Single setclipboard call -> nothing gets overwritten
+    setclipboard(fullClipboard)
+    return totalParts
+end
+
+-- Copy process
 local function startCopyProcess()
     if isRunning then return end
     isRunning = true
@@ -450,123 +386,10 @@ local function startCopyProcess()
     }
 
     local startTick = tick()
-    local totalPhases = 3
-    local currentPhase = 0
 
-    -- Schedule work across multiple heartbeats
-    local workQueue = {}
-
-    -- Phase 1: Collect all workspace objects (non-recursive first pass)
-    table.insert(workQueue, function()
-        currentPhase = 1
-        ui.Status.Text = "PHASE 1/3: Collecting objects..."
-        local objs = {}
-        pcall(function()
-            for _, obj in pairs(workspace:GetDescendants()) do
-                if obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Folder") or obj:IsA("UnionOperation") or obj:IsA("MeshPart") or obj:IsA("Part") or obj:IsA("WedgePart") or obj:IsA("CornerWedgePart") then
-                    table.insert(objs, obj)
-                end
-            end
-        end)
-        return objs
-    end)
-
-    -- Phase 2: Recursive copy (batched)
-    table.insert(workQueue, function(objs)
-        currentPhase = 2
-        local total = #objs
-        ui.Status.Text = "PHASE 2/3: Copying " .. total .. " objects..."
-        local count = 0
-        for i, obj in ipairs(objs) do
-            pcall(function()
-                local data = recursiveCopy(obj, 0)
-                if data then
-                    table.insert(copiedData.Instances, data)
-                end
-            end)
-            count = count + 1
-            -- Yield every 10 objects
-            if count % 10 == 0 then
-                RunService.Heartbeat:Wait()
-                pcall(function()
-                    ui.ProgFill:TweenSize(UDim2.new(i/total, 0, 1, 0), "Out", "Quad", 0.05, true)
-                end)
-            end
-        end
-        return total
-    end)
-
-    -- Phase 3: Script extraction (service by service to avoid mass Descendants call)
-    table.insert(workQueue, function()
-        currentPhase = 3
-        ui.Status.Text = "PHASE 3/3: Extracting scripts..."
-        local services = {
-            {workspace, "Workspace"},
-            {Players, "Players"},
-            {game:GetService("Lighting"), "Lighting"},
-            {game:GetService("ReplicatedStorage"), "ReplicatedStorage"},
-            {game:GetService("ServerScriptService"), "ServerScriptService"},
-            {game:GetService("StarterPack"), "StarterPack"},
-            {game:GetService("StarterGui"), "StarterGui"},
-            {game:GetService("StarterPlayer"), "StarterPlayer"},
-            {game:GetService("SoundService"), "SoundService"},
-            {game:GetService("Chat"), "Chat"},
-        }
-        local scriptCount = 0
-        for _, svcPair in ipairs(services) do
-            local svc = svcPair[1]
-            pcall(function()
-                for _, obj in pairs(svc:GetDescendants()) do
-                    if obj:IsA("LocalScript") or obj:IsA("ModuleScript") or obj:IsA("Script") then
-                        table.insert(copiedData.Scripts, {
-                            Name = obj.Name,
-                            ClassName = obj.ClassName,
-                            Source = obj.Source,
-                            Parent = obj.Parent and obj.Parent:GetFullName() or "Unknown",
-                            Disabled = pcall(function() return obj.Disabled end) and obj.Disabled or false,
-                        })
-                        scriptCount = scriptCount + 1
-                    end
-                    if scriptCount % 25 == 0 then
-                        RunService.Heartbeat:Wait()
-                    end
-                end
-            end)
-            ui.Status.Text = "PHASE 3/3: " .. svcPair[2] .. " (" .. scriptCount .. " scripts)"
-            pcall(function()
-                ui.ProgFill:TweenSize(UDim2.new((table.find(services, svcPair) or 1)/#services, 0, 1, 0), "Out", "Quad", 0.05, true)
-            end)
-        end
-        return scriptCount
-    end)
-
-    -- Execute work queue step by step with Heartbeat yields between steps
     spawn(function()
-        local phase1Result = nil
-        local phase2Result = nil
-        local phase3Result = nil
-
-        for _, taskFn in ipairs(workQueue) do
-            RunService.Heartbeat:Wait()
-            local success, result = pcall(function()
-                if phase1Result == nil and taskFn == workQueue[2] then
-                    return taskFn(workQueue[1] and select(2, pcall(workQueue[1])) or {})
-                elseif phase1Result ~= nil and taskFn == workQueue[3] then
-                    return taskFn()
-                else
-                    return taskFn()
-                end
-            end)
-            if not success then
-                ui.Status.Text = "ERROR: " .. tostring(result):sub(1, 30)
-                isRunning = false
-                ui.StartBtn.Text = "RETRY"
-                ui.StartBtn.BackgroundColor3 = Color3.fromRGB(255, 165, 0)
-                return
-            end
-        end
-
-        -- Re-execute properly
+        -- Phase 1: Collect workspace objects
+        ui.Status.Text = "Collecting objects..."
         local objs = {}
         pcall(function()
             for _, obj in pairs(workspace:GetDescendants()) do
@@ -576,6 +399,7 @@ local function startCopyProcess()
             end
         end)
 
+        -- Phase 2: Recursive copy batched
         ui.Status.Text = "Copying " .. #objs .. " objects..."
         for i, obj in ipairs(objs) do
             pcall(function()
@@ -592,11 +416,19 @@ local function startCopyProcess()
             end
         end
 
-        -- Scripts
+        -- Phase 3: Scripts service by service
         ui.Status.Text = "Extracting scripts..."
-        local services = {workspace, Players, game:GetService("Lighting"), game:GetService("ReplicatedStorage"), game:GetService("ServerScriptService"), game:GetService("StarterPack"), game:GetService("StarterGui"), game:GetService("StarterPlayer")}
+        local services = {
+            workspace, Players,
+            game:GetService("Lighting"),
+            game:GetService("ReplicatedStorage"),
+            game:GetService("ServerScriptService"),
+            game:GetService("StarterPack"),
+            game:GetService("StarterGui"),
+            game:GetService("StarterPlayer"),
+        }
         local scriptCount = 0
-        for _, svc in ipairs(services) do
+        for si, svc in ipairs(services) do
             pcall(function()
                 for _, obj in pairs(svc:GetDescendants()) do
                     if obj:IsA("LuaSourceContainer") then
@@ -613,14 +445,17 @@ local function startCopyProcess()
                     end
                 end
             end)
+            pcall(function()
+                ui.ProgFill:TweenSize(UDim2.new(si/#services, 0, 1, 0), "Out", "Quad", 0.05, true)
+            end)
         end
 
-        -- Build JSON and base64
+        -- Phase 4: Build JSON and base64
         ui.Status.Text = "Encoding..."
         RunService.Heartbeat:Wait()
 
         local fullData = {
-            Version = "2.0",
+            Version = "3.0",
             Metadata = copiedData.Metadata,
             Instances = copiedData.Instances,
             Scripts = copiedData.Scripts,
@@ -638,63 +473,47 @@ local function startCopyProcess()
         ui.StartBtn.BackgroundColor3 = SETTINGS.Accent
         ui.ExportBtn1.Visible = true
         ui.ExportBtn2.Visible = true
-        ui.Info.Text = "Objects: " .. #copiedData.Instances .. "\nScripts: " .. #copiedData.Scripts .. "\nSize: " .. sizeKB .. "KB base64\nFile: " .. currentFileName .. ".rblxm"
+        ui.Info.Text = "Objects: " .. #copiedData.Instances .. "\nScripts: " .. #copiedData.Scripts .. "\nSize: " .. sizeKB .. "KB"
         isRunning = false
     end)
 end
 
-local function exportToClipboard()
+local function exportAllToClipboard()
     if not currentB64Data or #currentB64Data == 0 then
         ui.Status.Text = "NO DATA - Run copy first"
         return
     end
-    ui.Status.Text = "Copying to clipboard..."
-    -- For files >1.5MB, split into chunks with reassembly instructions
-    if #currentB64Data > 1500000 then
-        local chunkSize = 1400000
-        local totalChunks = math.ceil(#currentB64Data / chunkSize)
-        for i = 1, totalChunks do
-            local chunk = string.sub(currentB64Data, (i-1)*chunkSize + 1, math.min(i*chunkSize, #currentB64Data))
-            local payload = "LEMMING_PART_" .. i .. "_OF_" .. totalChunks .. "_" .. currentFileName .. "|" .. chunk
-            setclipboard(payload)
-            ui.Status.Text = "Part " .. i .. "/" .. totalChunks .. " copied"
-            wait(1.5)
-        end
-        ui.Status.Text = "ALL " .. totalChunks .. " parts copied sequentially"
-        setclipboard("LEMMING_DONE: " .. currentFileName .. " | Parts: " .. totalChunks .. " | Use LemmingDecoder.html to reassemble")
+    ui.Status.Text = "Copying ALL to clipboard..."
+    local numParts = copyAllAtOnce(currentB64Data, currentFileName)
+    if numParts == 1 then
+        ui.Status.Text = "COPIED! Single part. Paste in decoder."
     else
-        setclipboard(currentB64Data)
-        ui.Status.Text = "Copied! " .. math.floor(#currentB64Data/1024) .. "KB"
+        ui.Status.Text = "COPIED! " .. numParts .. " parts in ONE string."
     end
 end
 
-local function showDecodeInstructions()
-    local instructions = [[
-DECODE INSTRUCTIONS:
-1. Copy clipboard content
-2. Go to: https://www.base64decode.org
-3. Paste and decode (output: .rblxm JSON)
-4. Save decoded text as .rblxm file
-5. Open in Roblox Studio: File → Open
+local function showDecoderInstructions()
+    local msg = [[
+DECODER STEPS:
+1. Open LemmingDecoderV3.html in browser
+2. Paste clipboard (Ctrl+V / long-press → Paste)
+3. Click DECODE & DOWNLOAD
+4. .rblxm file downloads automatically
 
-ALTERNATIVE:
-- Use LemmingDecoder.html (local HTML file)
-- Paste base64, click decode, download .rblxm
-
-For multi-part: concatenate all parts
-in order, then decode.]]
-    setclipboard(instructions)
+ALL parts are in ONE clipboard string.
+No sequential copying needed.
+]]
+    setclipboard(msg)
     ui.Status.Text = "Instructions copied to clipboard"
 end
 
 ui.StartBtn.MouseButton1Click:Connect(startCopyProcess)
 ui.StartBtn.TouchTap:Connect(startCopyProcess)
-ui.ExportBtn1.MouseButton1Click:Connect(exportToClipboard)
-ui.ExportBtn1.TouchTap:Connect(exportToClipboard)
-ui.ExportBtn2.MouseButton1Click:Connect(showDecodeInstructions)
-ui.ExportBtn2.TouchTap:Connect(showDecodeInstructions)
+ui.ExportBtn1.MouseButton1Click:Connect(exportAllToClipboard)
+ui.ExportBtn1.TouchTap:Connect(exportAllToClipboard)
+ui.ExportBtn2.MouseButton1Click:Connect(showDecoderInstructions)
+ui.ExportBtn2.TouchTap:Connect(showDecoderInstructions)
 
--- Cleanup
 game:GetService("CoreGui").ChildRemoved:Connect(function(child)
     if child.Name == "LemmingUI" then
         isRunning = false
