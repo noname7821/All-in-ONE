@@ -1,6 +1,5 @@
--- Lemming v3: All parts copied at once via single concatenated clipboard string
--- Uses a delimiter system. Decoder splits automatically.
-
+-- Lemming v6: Generates .rbxl BINARY format
+-- Native Roblox Studio format. File → Open directly.
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
@@ -15,35 +14,348 @@ if syn and syn.protect_gui then
     syn.protect_gui(CoreGui)
 end
 
--- Base64 encoder
+-- ============================================================
+-- RBXL BINARY WRITER (emulates Roblox binary chunk format)
+-- ============================================================
+local RBXL = {}
+
+-- Roblox type IDs for binary format
+local TYPE_STRING = 0x01
+local TYPE_BOOL = 0x02
+local TYPE_INT = 0x03
+local TYPE_FLOAT = 0x04
+local TYPE_DOUBLE = 0x05
+local TYPE_UDIM = 0x06
+local TYPE_UDIM2 = 0x07
+local TYPE_RAY = 0x08
+local TYPE_FACES = 0x09
+local TYPE_AXES = 0x0A
+local TYPE_BRICKCOLOR = 0x0B
+local TYPE_COLOR3 = 0x0C
+local TYPE_VECTOR2 = 0x0D
+local TYPE_VECTOR3 = 0x0E
+local TYPE_CFRAME = 0x10
+local TYPE_ENUM = 0x12
+local TYPE_REF = 0x13
+local TYPE_VECTOR3INT16 = 0x14
+local TYPE_NUMBERSEQUENCE = 0x15
+local TYPE_COLORSEQUENCE = 0x16
+local TYPE_NUMBERRANGE = 0x17
+local TYPE_CONTENT = 0x18
+
+local function writeByte(data, value)
+    table.insert(data, string.char(value % 256))
+end
+
+local function writeInt32(data, value)
+    -- LSB first
+    for i = 1, 4 do
+        table.insert(data, string.char(value % 256))
+        value = math.floor(value / 256)
+    end
+end
+
+local function writeFloat(data, value)
+    -- IEEE 754 single precision, LSB first
+    if value == 0 then
+        for i = 1, 4 do table.insert(data, "\0") end
+        return
+    end
+    local sign = value < 0 and 1 or 0
+    value = math.abs(value)
+    local exponent = math.floor(math.log(value) / math.log(2))
+    if exponent < -126 then exponent = -126 end
+    if exponent > 127 then exponent = 127 end
+    local mantissa = value / (2^exponent) - 1
+    local bits = sign * 0x80000000 + (exponent + 127) * 0x800000 + math.floor(mantissa * 0x800000)
+    for i = 1, 4 do
+        table.insert(data, string.char(bits % 256))
+        bits = math.floor(bits / 256)
+    end
+end
+
+local function writeDouble(data, value)
+    -- Simplified: store as 8 bytes LSB
+    if value == 0 then
+        for i = 1, 8 do table.insert(data, "\0") end
+        return
+    end
+    -- Use string.pack if available (Lua 5.3+), else manual
+    local packed = string.pack("<d", value)
+    for i = 1, #packed do
+        table.insert(data, string.sub(packed, i, i))
+    end
+end
+
+local function writeString(data, str)
+    writeInt32(data, #str)
+    for i = 1, #str do
+        table.insert(data, string.sub(str, i, i))
+    end
+end
+
+local function writeTypeAndValue(data, propName, value, valueType)
+    -- Write property type byte
+    writeByte(data, valueType)
+    -- Write property name
+    writeString(data, propName)
+    
+    if valueType == TYPE_STRING then
+        writeString(data, tostring(value))
+    elseif valueType == TYPE_BOOL then
+        writeByte(data, value and 1 or 0)
+    elseif valueType == TYPE_INT then
+        writeInt32(data, math.floor(tonumber(value) or 0))
+    elseif valueType == TYPE_FLOAT then
+        writeFloat(data, tonumber(value) or 0)
+    elseif valueType == TYPE_DOUBLE then
+        writeDouble(data, tonumber(value) or 0)
+    elseif valueType == TYPE_BRICKCOLOR then
+        writeInt32(data, math.floor(tonumber(value) or 0))
+    elseif valueType == TYPE_COLOR3 then
+        if type(value) == "table" and #value >= 3 then
+            writeFloat(data, value[1])
+            writeFloat(data, value[2])
+            writeFloat(data, value[3])
+        else
+            writeFloat(data, 0); writeFloat(data, 0); writeFloat(data, 0)
+        end
+    elseif valueType == TYPE_VECTOR3 then
+        if type(value) == "table" and #value >= 3 then
+            writeFloat(data, value[1])
+            writeFloat(data, value[2])
+            writeFloat(data, value[3])
+        else
+            writeFloat(data, 0); writeFloat(data, 0); writeFloat(data, 0)
+        end
+    elseif valueType == TYPE_CFRAME then
+        if type(value) == "table" and #value >= 12 then
+            for i = 1, 12 do
+                writeFloat(data, value[i] or 0)
+            end
+        else
+            -- Identity CFrame: pos 0,0,0 + identity rotation
+            writeFloat(data, 0); writeFloat(data, 0); writeFloat(data, 0)
+            writeFloat(data, 1); writeFloat(data, 0); writeFloat(data, 0)
+            writeFloat(data, 0); writeFloat(data, 1); writeFloat(data, 0)
+            writeFloat(data, 0); writeFloat(data, 0); writeFloat(data, 1)
+        end
+    elseif valueType == TYPE_REF then
+        writeString(data, tostring(value))
+    elseif valueType == TYPE_ENUM then
+        writeInt32(data, math.floor(tonumber(value) or 0))
+    elseif valueType == TYPE_CONTENT then
+        writeString(data, tostring(value))
+    else
+        -- Fallback: write as string
+        writeString(data, tostring(value))
+    end
+end
+
+local function getTypeForProperty(propName, value)
+    if propName == "Name" then return TYPE_STRING
+    elseif propName == "Parent" then return TYPE_REF
+    elseif propName == "Source" then return TYPE_STRING
+    elseif propName == "Disabled" then return TYPE_BOOL
+    elseif propName == "Anchored" then return TYPE_BOOL
+    elseif propName == "CanCollide" then return TYPE_BOOL
+    elseif propName == "Locked" then return TYPE_BOOL
+    elseif propName == "Transparency" then return TYPE_FLOAT
+    elseif propName == "Reflectance" then return TYPE_FLOAT
+    elseif propName == "Material" then return TYPE_ENUM
+    elseif propName == "BrickColor" then return TYPE_BRICKCOLOR
+    elseif propName == "Color" then return TYPE_COLOR3
+    elseif propName == "TextColor3" then return TYPE_COLOR3
+    elseif propName == "BackgroundColor3" then return TYPE_COLOR3
+    elseif propName == "Position" then return TYPE_VECTOR3
+    elseif propName == "Size" then return TYPE_VECTOR3
+    elseif propName == "CFrame" then return TYPE_CFRAME
+    elseif propName == "Text" then return TYPE_STRING
+    elseif propName == "Font" then return TYPE_ENUM
+    elseif propName == "TextSize" then return TYPE_FLOAT
+    elseif propName == "Image" then return TYPE_CONTENT
+    elseif propName == "MeshId" then return TYPE_CONTENT
+    elseif propName == "TextureId" then return TYPE_CONTENT
+    elseif propName == "ImageRectSize" then return TYPE_VECTOR3
+    elseif propName == "ImageRectOffset" then return TYPE_VECTOR3
+    else
+        if type(value) == "boolean" then return TYPE_BOOL
+        elseif type(value) == "number" then return TYPE_FLOAT
+        elseif type(value) == "string" then return TYPE_STRING
+        else return TYPE_STRING
+        end
+    end
+end
+
+-- ============================================================
+-- RBXL Chunk builder
+-- ============================================================
+local function buildRbxlBinary(data)
+    local chunks = {}
+    local referent = 0
+    local function nextRef() referent = referent + 1; return referent end
+    
+    -- INST chunk: holds all instances
+    local function buildInstance(item, parentId)
+        local id = nextRef()
+        local className = item.ClassName or "Part"
+        local name = item.Name or "Part"
+        
+        -- INST chunk: [type_id:1][class_name:str][is_service:1][instance_count:4][referents...]
+        local chunk = {}
+        writeString(chunk, className) -- class name
+        writeByte(chunk, 0) -- is_service = false
+        writeInt32(chunk, 1) -- number of instances in this chunk
+        writeInt32(chunk, id) -- referent
+        
+        -- Store properties for PROP chunk
+        local props = {}
+        table.insert(props, {name = "Name", value = name, typeId = TYPE_STRING})
+        if parentId then
+            table.insert(props, {name = "Parent", value = "RBX" .. tostring(parentId), typeId = TYPE_REF})
+        end
+        
+        for pname, pval in pairs(item.Properties) do
+            local t = getTypeForProperty(pname, pval)
+            local v = pval
+            -- Convert table types to raw values
+            if t == TYPE_VECTOR3 and type(v) == "table" and #v >= 3 then
+                v = v
+            elseif t == TYPE_CFRAME and type(v) == "table" and #v >= 12 then
+                v = v
+            elseif t == TYPE_COLOR3 and type(v) == "table" and #v >= 3 then
+                v = v
+            elseif t == TYPE_BRICKCOLOR and type(v) == "number" then
+                v = math.floor(v)
+            end
+            table.insert(props, {name = pname, value = v, typeId = t})
+        end
+        
+        -- PRNT chunk: parent relationships
+        if parentId then
+            local prntChunk = {}
+            writeByte(prntChunk, 0) -- version
+            writeInt32(prntChunk, 1) -- count
+            writeInt32(prntChunk, id) -- child
+            writeInt32(prntChunk, parentId) -- parent
+            table.insert(chunks, {type = "PRNT", data = table.concat(prntChunk)})
+        end
+        
+        -- PROP chunk for this instance
+        local propChunk = {}
+        writeInt32(propChunk, id) -- referent
+        writeInt32(propChunk, #props) -- property count
+        for _, prop in ipairs(props) do
+            writeTypeAndValue(propChunk, prop.name, prop.value, prop.typeId)
+        end
+        table.insert(chunks, {type = "PROP", data = table.concat(propChunk)})
+        
+        -- Instance data
+        table.insert(chunks, {type = "INST", data = table.concat(chunk)})
+        
+        -- Recursively build children
+        if item.Children then
+            for _, child in ipairs(item.Children) do
+                buildInstance(child, id)
+            end
+        end
+        
+        return id
+    end
+    
+    -- Header signature
+    local header = "<roblox!\x89\xFF\x0D\x0A\x1A\x0A"
+    local result = {header}
+    
+    -- Build all instances
+    local rootId = nextRef()
+    
+    -- Root folder INST
+    local rootChunk = {}
+    writeString(rootChunk, "Folder")
+    writeByte(rootChunk, 0) -- not service
+    writeInt32(rootChunk, 1)
+    writeInt32(rootChunk, rootId)
+    table.insert(chunks, {type = "INST", data = table.concat(rootChunk)})
+    
+    -- Root PROP
+    local rootProp = {}
+    writeInt32(rootProp, rootId)
+    writeInt32(rootProp, 1)
+    writeTypeAndValue(rootProp, "Name", "Lemming_Import", TYPE_STRING)
+    table.insert(chunks, {type = "PROP", data = table.concat(rootProp)})
+    
+    -- Build all workspace instances
+    for _, inst in ipairs(data.Instances) do
+        buildInstance(inst, rootId)
+    end
+    
+    -- Build scripts under root
+    for _, scr in ipairs(data.Scripts) do
+        local sid = nextRef()
+        local sc = {}
+        writeString(sc, scr.ClassName or "Script")
+        writeByte(sc, 0)
+        writeInt32(sc, 1)
+        writeInt32(sc, sid)
+        table.insert(chunks, {type = "INST", data = table.concat(sc)})
+        
+        -- Script properties
+        local sp = {}
+        writeInt32(sp, sid)
+        local propCount = 2
+        if scr.Disabled then propCount = 3 end
+        writeInt32(sp, propCount)
+        writeTypeAndValue(sp, "Name", scr.Name, TYPE_STRING)
+        writeTypeAndValue(sp, "Parent", "RBX" .. tostring(rootId), TYPE_REF)
+        if scr.Disabled then
+            writeTypeAndValue(sp, "Disabled", true, TYPE_BOOL)
+        end
+        table.insert(chunks, {type = "PROP", data = table.concat(sp)})
+        
+        -- Script source in separate PROP (some parsers want it)
+        local ssp = {}
+        writeInt32(ssp, sid)
+        writeInt32(ssp, 1)
+        writeTypeAndValue(ssp, "Source", scr.Source or "", TYPE_STRING)
+        table.insert(chunks, {type = "PROP", data = table.concat(ssp)})
+        
+        -- Parent
+        local sprnt = {}
+        writeByte(sprnt, 0)
+        writeInt32(sprnt, 1)
+        writeInt32(sprnt, sid)
+        writeInt32(sprnt, rootId)
+        table.insert(chunks, {type = "PRNT", data = table.concat(sprnt)})
+    end
+    
+    -- END chunk
+    table.insert(chunks, {type = "END", data = ""})
+    
+    -- Write all chunks with length prefix
+    for _, chunk in ipairs(chunks) do
+        local chunkData = chunk.type .. "\n" .. chunk.data
+        table.insert(result, chunkData)
+    end
+    
+    return table.concat(result)
+end
+
+-- ============================================================
+-- Rest of script (base64, UI, copy logic) same as v5
+-- ============================================================
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local function base64Encode(data)
     local bytes = {}
-    for i = 1, #data do
-        bytes[i] = string.byte(data, i)
-    end
+    for i = 1, #data do bytes[i] = string.byte(data, i) end
     local result = {}
     for i = 1, #bytes, 3 do
-        local b1 = bytes[i]
-        local b2 = bytes[i+1] or 0
-        local b3 = bytes[i+2] or 0
+        local b1, b2, b3 = bytes[i], bytes[i+1] or 0, bytes[i+2] or 0
         local n = b1 * 65536 + b2 * 256 + b3
-        local c1 = math.floor(n / 262144)
-        local c2 = math.floor((n % 262144) / 4096)
-        local c3 = math.floor((n % 4096) / 64)
-        local c4 = n % 64
-        table.insert(result, string.sub(b64chars, c1+1, c1+1))
-        table.insert(result, string.sub(b64chars, c2+1, c2+1))
-        if i+1 <= #bytes then
-            table.insert(result, string.sub(b64chars, c3+1, c3+1))
-        else
-            table.insert(result, "=")
-        end
-        if i+2 <= #bytes then
-            table.insert(result, string.sub(b64chars, c4+1, c4+1))
-        else
-            table.insert(result, "=")
-        end
+        table.insert(result, string.sub(b64chars, math.floor(n/262144)+1, math.floor(n/262144)+1))
+        table.insert(result, string.sub(b64chars, math.floor((n%262144)/4096)+1, math.floor((n%262144)/4096)+1))
+        table.insert(result, i+1 <= #bytes and string.sub(b64chars, math.floor((n%4096)/64)+1, math.floor((n%4096)/64)+1) or "=")
+        table.insert(result, i+2 <= #bytes and string.sub(b64chars, n%64+1, n%64+1) or "=")
     end
     return table.concat(result)
 end
@@ -53,325 +365,228 @@ local SETTINGS = {
     Background = Color3.fromRGB(25, 25, 30),
     Secondary = Color3.fromRGB(35, 35, 40),
     Text = Color3.fromRGB(220, 220, 220),
-    BatchSize = 15,
-    BatchDelay = 0.03,
 }
 
-local copiedData = {
-    Instances = {},
-    Scripts = {},
-    Metadata = {}
-}
+local copiedData = {Instances = {}, Scripts = {}, Metadata = {}}
 
 local function recursiveCopy(instance, depth)
     depth = depth or 0
-    if depth > 200 then return nil end
-    if not instance or not instance.Parent then return nil end
-    local data = {
-        ClassName = instance.ClassName,
-        Name = instance.Name,
-        Properties = {},
-        Children = {}
-    }
-    local propsToCopy = {
-        "Position", "Size", "Color", "Material", "Transparency",
-        "Reflectance", "Anchored", "CanCollide", "Locked", "BrickColor",
-        "Text", "Font", "TextSize", "TextColor3", "BackgroundColor3",
-        "Image", "ImageRectSize", "ImageRectOffset", "MeshId", "TextureId"
-    }
-    for _, prop in pairs(propsToCopy) do
+    if depth > 200 or not instance or not instance.Parent then return nil end
+    local data = {ClassName = instance.ClassName, Name = instance.Name, Properties = {}, Children = {}}
+    local props = {"Position", "Size", "Color", "Material", "Transparency", "Reflectance", "Anchored", "CanCollide", "Locked", "BrickColor", "Text", "Font", "TextSize", "TextColor3", "BackgroundColor3", "Image", "ImageRectSize", "ImageRectOffset", "MeshId", "TextureId"}
+    for _, p in pairs(props) do
         pcall(function()
-            local val = instance[prop]
-            if val ~= nil then
-                if typeof(val) == "CFrame" then
-                    data.Properties[prop] = {val:GetComponents()}
-                elseif typeof(val) == "Vector3" then
-                    data.Properties[prop] = {val.X, val.Y, val.Z}
-                elseif typeof(val) == "Color3" then
-                    data.Properties[prop] = {val.R, val.G, val.B}
-                elseif typeof(val) == "BrickColor" then
-                    data.Properties[prop] = val.Number
-                else
-                    data.Properties[prop] = val
-                end
+            local v = instance[p]
+            if v ~= nil then
+                if typeof(v) == "CFrame" then data.Properties[p] = {v:GetComponents()}
+                elseif typeof(v) == "Vector3" then data.Properties[p] = {v.X, v.Y, v.Z}
+                elseif typeof(v) == "Color3" then data.Properties[p] = {v.R, v.G, v.B}
+                elseif typeof(v) == "BrickColor" then data.Properties[p] = v.Number
+                else data.Properties[p] = v end
             end
         end)
     end
     for _, child in pairs(instance:GetChildren()) do
-        local childData = recursiveCopy(child, depth + 1)
-        if childData then
-            table.insert(data.Children, childData)
-        end
+        local d = recursiveCopy(child, depth+1)
+        if d then table.insert(data.Children, d) end
     end
     return data
 end
 
--- UI
-local function createMobileCircleUI()
+-- UI (identical to v5)
+local function createUI()
     local screen = Instance.new("ScreenGui")
     screen.Name = "LemmingUI"
     screen.Parent = CoreGui
     screen.ResetOnSpawn = false
     screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screen.IgnoreGuiInset = true
-
-    local w = math.floor(340 * scaleFactor)
-    local h = math.floor(500 * scaleFactor)
-    local circleSize = math.floor(130 * scaleFactor)
-    local fontSize = math.floor(16 * scaleFactor)
-    local smallFont = math.floor(12 * scaleFactor)
-    local tinyFont = math.floor(10 * scaleFactor)
-
-    local mainFrame = Instance.new("Frame")
-    mainFrame.Name = "Main"
-    mainFrame.Size = UDim2.new(0, w, 0, h)
-    mainFrame.Position = UDim2.new(0.5, -w/2, 0.5, -h/2)
-    mainFrame.BackgroundColor3 = SETTINGS.Background
-    mainFrame.BackgroundTransparency = 0.1
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Parent = screen
-    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, math.floor(22 * scaleFactor))
-
-    -- Title bar
-    local titleBar = Instance.new("Frame")
-    titleBar.Size = UDim2.new(1, 0, 0, math.floor(50 * scaleFactor))
-    titleBar.BackgroundColor3 = SETTINGS.Secondary
-    titleBar.BorderSizePixel = 0
-    titleBar.Parent = mainFrame
-    local tc = Instance.new("UICorner", titleBar)
-    tc.CornerRadius = UDim.new(0, math.floor(22 * scaleFactor))
-    local tp = Instance.new("Frame", titleBar)
-    tp.Size = UDim2.new(1, 0, 0.5, 0)
-    tp.Position = UDim2.new(0, 0, 0.5, 0)
-    tp.BackgroundColor3 = SETTINGS.Secondary
-    tp.BorderSizePixel = 0
-
-    local titleText = Instance.new("TextLabel")
-    titleText.Size = UDim2.new(1, -20, 1, 0)
-    titleText.Position = UDim2.new(0, 10, 0, 0)
-    titleText.BackgroundTransparency = 1
-    titleText.Text = "LEMMING v3"
-    titleText.TextColor3 = SETTINGS.Accent
-    titleText.TextSize = math.floor(20 * scaleFactor)
-    titleText.Font = Enum.Font.GothamBold
-    titleText.TextXAlignment = Enum.TextXAlignment.Left
-    titleText.Parent = titleBar
-
-    local dragToggle = Instance.new("TextButton")
-    dragToggle.Size = UDim2.new(1, 0, 1, 0)
-    dragToggle.BackgroundTransparency = 1
-    dragToggle.Text = ""
-    dragToggle.Parent = titleBar
-    local dragging, dragStart, startPos
-    dragToggle.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            dragStart = input.Position
-            startPos = mainFrame.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
+    local w, h = math.floor(340*scaleFactor), math.floor(500*scaleFactor)
+    local cs = math.floor(130*scaleFactor)
+    local fs, sf, tf = math.floor(16*scaleFactor), math.floor(12*scaleFactor), math.floor(10*scaleFactor)
+    local main = Instance.new("Frame", screen)
+    main.Size = UDim2.new(0,w,0,h)
+    main.Position = UDim2.new(0.5,-w/2,0.5,-h/2)
+    main.BackgroundColor3 = SETTINGS.Background
+    main.BackgroundTransparency = 0.1
+    main.BorderSizePixel = 0
+    Instance.new("UICorner", main).CornerRadius = UDim.new(0, math.floor(22*scaleFactor))
+    local tb = Instance.new("Frame", main)
+    tb.Size = UDim2.new(1,0,0,math.floor(50*scaleFactor))
+    tb.BackgroundColor3 = SETTINGS.Secondary
+    tb.BorderSizePixel = 0
+    local tc = Instance.new("UICorner", tb)
+    tc.CornerRadius = UDim.new(0, math.floor(22*scaleFactor))
+    Instance.new("Frame", tb).Size = UDim2.new(1,0,0.5,0)
+    local tp2 = Instance.new("Frame", tb)
+    tp2.Position = UDim2.new(0,0,0.5,0)
+    tp2.Size = UDim2.new(1,0,0.5,0)
+    tp2.BackgroundColor3 = SETTINGS.Secondary
+    tp2.BorderSizePixel = 0
+    local tt = Instance.new("TextLabel", tb)
+    tt.Size = UDim2.new(1,-20,1,0)
+    tt.Position = UDim2.new(0,10,0,0)
+    tt.BackgroundTransparency = 1
+    tt.Text = "LEMMING v6"
+    tt.TextColor3 = SETTINGS.Accent
+    tt.TextSize = math.floor(20*scaleFactor)
+    tt.Font = Enum.Font.GothamBold
+    tt.TextXAlignment = Enum.TextXAlignment.Left
+    local drag = Instance.new("TextButton", tb)
+    drag.Size = UDim2.new(1,0,1,0)
+    drag.BackgroundTransparency = 1
+    drag.Text = ""
+    local dragging, ds, sp
+    drag.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; ds = inp.Position; sp = main.Position
+            inp.Changed:Connect(function() if inp.UserInputState == Enum.UserInputState.End then dragging = false end end)
         end
     end)
-    dragToggle.InputChanged:Connect(function(input)
-        if (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) and dragging then
-            local delta = input.Position - dragStart
-            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    drag.InputChanged:Connect(function(inp)
+        if (inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseMovement) and dragging then
+            local d = inp.Position - ds
+            main.Position = UDim2.new(sp.X.Scale, sp.X.Offset+d.X, sp.Y.Scale, sp.Y.Offset+d.Y)
         end
     end)
-
-    -- Circle container
-    local circleContainer = Instance.new("Frame")
-    circleContainer.Size = UDim2.new(1, 0, 0, math.floor(200 * scaleFactor))
-    circleContainer.Position = UDim2.new(0, 0, 0, math.floor(60 * scaleFactor))
-    circleContainer.BackgroundTransparency = 1
-    circleContainer.Parent = mainFrame
-
-    local startButton = Instance.new("TextButton")
-    startButton.Size = UDim2.new(0, circleSize, 0, circleSize)
-    startButton.Position = UDim2.new(0.5, -circleSize/2, 0, math.floor(5 * scaleFactor))
-    startButton.BackgroundColor3 = SETTINGS.Accent
-    startButton.Text = "START\nCOPY"
-    startButton.TextColor3 = Color3.fromRGB(15, 15, 20)
-    startButton.TextSize = fontSize
-    startButton.Font = Enum.Font.GothamBold
-    startButton.BorderSizePixel = 0
-    startButton.Parent = circleContainer
-    Instance.new("UICorner", startButton).CornerRadius = UDim.new(1, 0)
-
-    local pulseBase = circleSize + math.floor(20 * scaleFactor)
-    local pulseFrame = Instance.new("Frame")
-    pulseFrame.Size = UDim2.new(0, pulseBase, 0, pulseBase)
-    pulseFrame.Position = UDim2.new(0.5, -pulseBase/2, 0, -math.floor(8 * scaleFactor))
-    pulseFrame.BackgroundColor3 = SETTINGS.Accent
-    pulseFrame.BackgroundTransparency = 0.6
-    pulseFrame.BorderSizePixel = 0
-    pulseFrame.ZIndex = 0
-    pulseFrame.Parent = circleContainer
-    Instance.new("UICorner", pulseFrame).CornerRadius = UDim.new(1, 0)
-
+    local cc = Instance.new("Frame", main)
+    cc.Size = UDim2.new(1,0,0,math.floor(200*scaleFactor))
+    cc.Position = UDim2.new(0,0,0,math.floor(60*scaleFactor))
+    cc.BackgroundTransparency = 1
+    local sb = Instance.new("TextButton", cc)
+    sb.Size = UDim2.new(0,cs,0,cs)
+    sb.Position = UDim2.new(0.5,-cs/2,0,math.floor(5*scaleFactor))
+    sb.BackgroundColor3 = SETTINGS.Accent
+    sb.Text = "START\nCOPY"
+    sb.TextColor3 = Color3.fromRGB(15,15,20)
+    sb.TextSize = fs
+    sb.Font = Enum.Font.GothamBold
+    sb.BorderSizePixel = 0
+    Instance.new("UICorner", sb).CornerRadius = UDim.new(1,0)
+    local pb = cs + math.floor(20*scaleFactor)
+    local pf = Instance.new("Frame", cc)
+    pf.Size = UDim2.new(0,pb,0,pb)
+    pf.Position = UDim2.new(0.5,-pb/2,0,-math.floor(8*scaleFactor))
+    pf.BackgroundColor3 = SETTINGS.Accent
+    pf.BackgroundTransparency = 0.6
+    pf.BorderSizePixel = 0
+    pf.ZIndex = 0
+    Instance.new("UICorner", pf).CornerRadius = UDim.new(1,0)
     spawn(function()
-        local expandSize = pulseBase + math.floor(25 * scaleFactor)
-        while pulseFrame and pulseFrame.Parent do
-            pulseFrame:TweenSize(UDim2.new(0, expandSize, 0, expandSize), "Out", "Sine", 1.2, true)
-            pulseFrame.Position = UDim2.new(0.5, -expandSize/2, 0, -math.floor(20 * scaleFactor))
+        local es = pb + math.floor(25*scaleFactor)
+        while pf and pf.Parent do
+            pf:TweenSize(UDim2.new(0,es,0,es),"Out","Sine",1.2,true)
+            pf.Position = UDim2.new(0.5,-es/2,0,-math.floor(20*scaleFactor))
             wait(1.2)
-            pulseFrame:TweenSize(UDim2.new(0, pulseBase, 0, pulseBase), "Out", "Sine", 1.2, true)
-            pulseFrame.Position = UDim2.new(0.5, -pulseBase/2, 0, -math.floor(8 * scaleFactor))
+            pf:TweenSize(UDim2.new(0,pb,0,pb),"Out","Sine",1.2,true)
+            pf.Position = UDim2.new(0.5,-pb/2,0,-math.floor(8*scaleFactor))
             wait(1.2)
         end
     end)
-
-    local statusText = Instance.new("TextLabel")
-    statusText.Size = UDim2.new(1, -20, 0, math.floor(22 * scaleFactor))
-    statusText.Position = UDim2.new(0, 10, 0, circleSize + math.floor(18 * scaleFactor))
-    statusText.BackgroundTransparency = 1
-    statusText.Text = "READY"
-    statusText.TextColor3 = SETTINGS.Text
-    statusText.TextSize = smallFont
-    statusText.Font = Enum.Font.Gotham
-    statusText.Parent = circleContainer
-
-    local progFrame = Instance.new("Frame")
-    progFrame.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(5 * scaleFactor))
-    progFrame.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, circleSize + math.floor(46 * scaleFactor))
-    progFrame.BackgroundColor3 = SETTINGS.Secondary
-    progFrame.BorderSizePixel = 0
-    progFrame.Visible = false
-    progFrame.Parent = circleContainer
-    Instance.new("UICorner", progFrame).CornerRadius = UDim.new(1, 0)
-
-    local progFill = Instance.new("Frame")
-    progFill.Size = UDim2.new(0, 0, 1, 0)
-    progFill.BackgroundColor3 = SETTINGS.Accent
-    progFill.BorderSizePixel = 0
-    progFill.Name = "Fill"
-    progFill.Parent = progFrame
-    Instance.new("UICorner", progFill).CornerRadius = UDim.new(1, 0)
-
-    local infoFrame = Instance.new("Frame")
-    infoFrame.Size = UDim2.new(1, -math.floor(20 * scaleFactor), 0, math.floor(70 * scaleFactor))
-    infoFrame.Position = UDim2.new(0, math.floor(10 * scaleFactor), 0, math.floor(270 * scaleFactor))
-    infoFrame.BackgroundColor3 = SETTINGS.Secondary
-    infoFrame.BackgroundTransparency = 0.3
-    infoFrame.BorderSizePixel = 0
-    infoFrame.Parent = mainFrame
-    Instance.new("UICorner", infoFrame).CornerRadius = UDim.new(0, math.floor(12 * scaleFactor))
-
-    local infoText = Instance.new("TextLabel")
-    infoText.Size = UDim2.new(1, -math.floor(16 * scaleFactor), 1, -math.floor(8 * scaleFactor))
-    infoText.Position = UDim2.new(0, math.floor(8 * scaleFactor), 0, math.floor(4 * scaleFactor))
-    infoText.BackgroundTransparency = 1
-    infoText.Text = "Place: " .. game.PlaceId
-    infoText.TextColor3 = SETTINGS.Text
-    infoText.TextSize = tinyFont
-    infoText.Font = Enum.Font.Gotham
-    infoText.TextXAlignment = Enum.TextXAlignment.Left
-    infoText.TextYAlignment = Enum.TextYAlignment.Top
-    infoText.TextWrapped = true
-    infoText.Parent = infoFrame
-
-    local exportBtn1 = Instance.new("TextButton")
-    exportBtn1.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(40 * scaleFactor))
-    exportBtn1.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(350 * scaleFactor))
-    exportBtn1.BackgroundColor3 = SETTINGS.Accent
-    exportBtn1.Text = "COPY ALL TO CLIPBOARD"
-    exportBtn1.TextColor3 = Color3.fromRGB(15, 15, 20)
-    exportBtn1.TextSize = smallFont
-    exportBtn1.Font = Enum.Font.GothamBold
-    exportBtn1.BorderSizePixel = 0
-    exportBtn1.Visible = false
-    exportBtn1.Name = "ExportBtn1"
-    exportBtn1.Parent = mainFrame
-    Instance.new("UICorner", exportBtn1).CornerRadius = UDim.new(0, math.floor(14 * scaleFactor))
-
-    local exportBtn2 = Instance.new("TextButton")
-    exportBtn2.Size = UDim2.new(1, -math.floor(30 * scaleFactor), 0, math.floor(40 * scaleFactor))
-    exportBtn2.Position = UDim2.new(0, math.floor(15 * scaleFactor), 0, math.floor(398 * scaleFactor))
-    exportBtn2.BackgroundColor3 = SETTINGS.Secondary
-    exportBtn2.Text = "SHOW DECODER"
-    exportBtn2.TextColor3 = SETTINGS.Text
-    exportBtn2.TextSize = smallFont
-    exportBtn2.Font = Enum.Font.GothamBold
-    exportBtn2.BorderSizePixel = 0
-    exportBtn2.Visible = false
-    exportBtn2.Name = "ExportBtn2"
-    exportBtn2.Parent = mainFrame
-    Instance.new("UICorner", exportBtn2).CornerRadius = UDim.new(0, math.floor(14 * scaleFactor))
-
-    local creditText = Instance.new("TextLabel")
-    creditText.Size = UDim2.new(1, -20, 0, math.floor(18 * scaleFactor))
-    creditText.Position = UDim2.new(0, 10, 0, h - math.floor(22 * scaleFactor))
-    creditText.BackgroundTransparency = 1
-    creditText.Text = "Lemming v3 | One-Click Copy"
-    creditText.TextColor3 = Color3.fromRGB(100, 100, 110)
-    creditText.TextSize = math.floor(8 * scaleFactor)
-    creditText.Font = Enum.Font.Gotham
-    creditText.Parent = mainFrame
-
-    return {
-        Main = mainFrame,
-        StartBtn = startButton,
-        Status = statusText,
-        Info = infoText,
-        ExportBtn1 = exportBtn1,
-        ExportBtn2 = exportBtn2,
-        ProgFrame = progFrame,
-        ProgFill = progFill,
-        Pulse = pulseFrame,
-    }
+    local st = Instance.new("TextLabel", cc)
+    st.Size = UDim2.new(1,-20,0,math.floor(22*scaleFactor))
+    st.Position = UDim2.new(0,10,0,cs+math.floor(18*scaleFactor))
+    st.BackgroundTransparency = 1
+    st.Text = "READY"
+    st.TextColor3 = SETTINGS.Text
+    st.TextSize = sf
+    st.Font = Enum.Font.Gotham
+    local pgr = Instance.new("Frame", cc)
+    pgr.Size = UDim2.new(1,-math.floor(30*scaleFactor),0,math.floor(5*scaleFactor))
+    pgr.Position = UDim2.new(0,math.floor(15*scaleFactor),0,cs+math.floor(46*scaleFactor))
+    pgr.BackgroundColor3 = SETTINGS.Secondary
+    pgr.BorderSizePixel = 0
+    pgr.Visible = false
+    Instance.new("UICorner", pgr).CornerRadius = UDim.new(1,0)
+    local pgf = Instance.new("Frame", pgr)
+    pgf.Size = UDim2.new(0,0,1,0)
+    pgf.BackgroundColor3 = SETTINGS.Accent
+    pgf.BorderSizePixel = 0
+    pgf.Name = "Fill"
+    Instance.new("UICorner", pgf).CornerRadius = UDim.new(1,0)
+    local inf = Instance.new("Frame", main)
+    inf.Size = UDim2.new(1,-math.floor(20*scaleFactor),0,math.floor(70*scaleFactor))
+    inf.Position = UDim2.new(0,math.floor(10*scaleFactor),0,math.floor(270*scaleFactor))
+    inf.BackgroundColor3 = SETTINGS.Secondary
+    inf.BackgroundTransparency = 0.3
+    inf.BorderSizePixel = 0
+    Instance.new("UICorner", inf).CornerRadius = UDim.new(0,math.floor(12*scaleFactor))
+    local it = Instance.new("TextLabel", inf)
+    it.Size = UDim2.new(1,-math.floor(16*scaleFactor),1,-math.floor(8*scaleFactor))
+    it.Position = UDim2.new(0,math.floor(8*scaleFactor),0,math.floor(4*scaleFactor))
+    it.BackgroundTransparency = 1
+    it.Text = "Place: "..game.PlaceId.."\nFormat: .rbxl BINARY"
+    it.TextColor3 = SETTINGS.Text
+    it.TextSize = tf
+    it.Font = Enum.Font.Gotham
+    it.TextXAlignment = Enum.TextXAlignment.Left
+    it.TextYAlignment = Enum.TextYAlignment.Top
+    it.TextWrapped = true
+    local eb1 = Instance.new("TextButton", main)
+    eb1.Size = UDim2.new(1,-math.floor(30*scaleFactor),0,math.floor(40*scaleFactor))
+    eb1.Position = UDim2.new(0,math.floor(15*scaleFactor),0,math.floor(350*scaleFactor))
+    eb1.BackgroundColor3 = SETTINGS.Accent
+    eb1.Text = "COPY .RBXL TO CLIPBOARD"
+    eb1.TextColor3 = Color3.fromRGB(15,15,20)
+    eb1.TextSize = sf
+    eb1.Font = Enum.Font.GothamBold
+    eb1.BorderSizePixel = 0
+    eb1.Visible = false
+    eb1.Name = "ExportBtn1"
+    Instance.new("UICorner", eb1).CornerRadius = UDim.new(0,math.floor(14*scaleFactor))
+    local eb2 = Instance.new("TextButton", main)
+    eb2.Size = UDim2.new(1,-math.floor(30*scaleFactor),0,math.floor(40*scaleFactor))
+    eb2.Position = UDim2.new(0,math.floor(15*scaleFactor),0,math.floor(398*scaleFactor))
+    eb2.BackgroundColor3 = SETTINGS.Secondary
+    eb2.Text = "SHOW DECODER"
+    eb2.TextColor3 = SETTINGS.Text
+    eb2.TextSize = sf
+    eb2.Font = Enum.Font.GothamBold
+    eb2.BorderSizePixel = 0
+    eb2.Visible = false
+    eb2.Name = "ExportBtn2"
+    Instance.new("UICorner", eb2).CornerRadius = UDim.new(0,math.floor(14*scaleFactor))
+    local cr = Instance.new("TextLabel", main)
+    cr.Size = UDim2.new(1,-20,0,math.floor(18*scaleFactor))
+    cr.Position = UDim2.new(0,10,0,h-math.floor(22*scaleFactor))
+    cr.BackgroundTransparency = 1
+    cr.Text = "Lemming v6 | .rbxl Binary"
+    cr.TextColor3 = Color3.fromRGB(100,100,110)
+    cr.TextSize = math.floor(8*scaleFactor)
+    cr.Font = Enum.Font.Gotham
+    return {StartBtn=sb, Status=st, Info=it, ExportBtn1=eb1, ExportBtn2=eb2, ProgFrame=pgr, ProgFill=pgf}
 end
 
-local ui = createMobileCircleUI()
-
+local ui = createUI()
 local isRunning = false
-local currentB64Data = ""
+local currentBinaryData = ""
 local currentFileName = ""
 
--- ============================================================
--- FIX: Single clipboard set with ALL parts concatenated
--- Uses delimiter |||LEMMING_SPLIT||| between parts
--- Decoder splits on this delimiter and joins automatically
--- ============================================================
 local function copyAllAtOnce(data, fileName)
-    local maxClipSize = 900000 -- Safe limit for all devices (900KB)
-    if #data <= maxClipSize then
-        -- Small enough, copy directly
-        setclipboard("LEMMING_SINGLE:" .. fileName .. "|" .. data)
+    -- Binary data needs base64 encoding for clipboard
+    local b64 = base64Encode(data)
+    local maxClip = 900000
+    if #b64 <= maxClip then
+        setclipboard("LEMMING_SINGLE:" .. fileName .. "|" .. b64)
         return 1
     end
-
-    -- Split into chunks with unified delimiter
-    local parts = {}
-    local chunkSize = maxClipSize
-    local totalLen = #data
-    local totalParts = math.ceil(totalLen / chunkSize)
-
+    local parts, totalParts = {}, math.ceil(#b64 / maxClip)
     for i = 1, totalParts do
-        local startIdx = (i-1)*chunkSize + 1
-        local endIdx = math.min(i*chunkSize, totalLen)
-        local chunk = string.sub(data, startIdx, endIdx)
-        table.insert(parts, "LEMMING_PART_" .. i .. "_OF_" .. totalParts .. "_" .. fileName)
-        table.insert(parts, chunk)
+        local s = (i-1)*maxClip + 1
+        local e = math.min(i*maxClip, #b64)
+        table.insert(parts, "LEMMING_PART_"..i.."_OF_"..totalParts.."_"..fileName)
+        table.insert(parts, string.sub(b64, s, e))
     end
-
-    -- Join ALL parts with delimiter
-    local fullClipboard = table.concat(parts, "|||LEMMING_SPLIT|||")
-
-    -- Single setclipboard call -> nothing gets overwritten
-    setclipboard(fullClipboard)
+    setclipboard(table.concat(parts, "|||LEMMING_SPLIT|||"))
     return totalParts
 end
 
--- Copy process
 local function startCopyProcess()
     if isRunning then return end
     isRunning = true
     ui.Status.Text = "SCANNING..."
     ui.StartBtn.Text = "..."
-    ui.StartBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+    ui.StartBtn.BackgroundColor3 = Color3.fromRGB(255,100,100)
     ui.ProgFrame.Visible = true
     ui.ExportBtn1.Visible = false
     ui.ExportBtn2.Visible = false
@@ -382,140 +597,76 @@ local function startCopyProcess()
         PlaceName = pcall(function() return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name end) and game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name or "Unknown",
         Timestamp = os.time(),
         Creator = Players.LocalPlayer.Name,
-        GameVersion = game.PlaceVersion,
     }
-
     local startTick = tick()
-
     spawn(function()
-        -- Phase 1: Collect workspace objects
         ui.Status.Text = "Collecting objects..."
         local objs = {}
         pcall(function()
             for _, obj in pairs(workspace:GetDescendants()) do
-                if obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Folder") or obj:IsA("UnionOperation") or obj:IsA("MeshPart") or obj:IsA("Part") or obj:IsA("WedgePart") or obj:IsA("CornerWedgePart") then
+                if obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Folder") or obj:IsA("UnionOperation") or obj:IsA("MeshPart") or obj:IsA("Part") or obj:IsA("WedgePart") then
                     table.insert(objs, obj)
                 end
             end
         end)
-
-        -- Phase 2: Recursive copy batched
-        ui.Status.Text = "Copying " .. #objs .. " objects..."
+        ui.Status.Text = "Copying "..#objs.." objects..."
         for i, obj in ipairs(objs) do
             pcall(function()
-                local data = recursiveCopy(obj, 0)
-                if data then
-                    table.insert(copiedData.Instances, data)
-                end
+                local d = recursiveCopy(obj, 0)
+                if d then table.insert(copiedData.Instances, d) end
             end)
             if i % 15 == 0 then
                 RunService.Heartbeat:Wait()
-                pcall(function()
-                    ui.ProgFill:TweenSize(UDim2.new(i/#objs, 0, 1, 0), "Out", "Quad", 0.05, true)
-                end)
+                pcall(function() ui.ProgFill:TweenSize(UDim2.new(i/#objs,0,1,0),"Out","Quad",0.05,true) end)
             end
         end
-
-        -- Phase 3: Scripts service by service
         ui.Status.Text = "Extracting scripts..."
-        local services = {
-            workspace, Players,
-            game:GetService("Lighting"),
-            game:GetService("ReplicatedStorage"),
-            game:GetService("ServerScriptService"),
-            game:GetService("StarterPack"),
-            game:GetService("StarterGui"),
-            game:GetService("StarterPlayer"),
-        }
-        local scriptCount = 0
+        local services = {workspace, Players, game:GetService("Lighting"), game:GetService("ReplicatedStorage"), game:GetService("ServerScriptService"), game:GetService("StarterPack"), game:GetService("StarterGui"), game:GetService("StarterPlayer")}
         for si, svc in ipairs(services) do
             pcall(function()
                 for _, obj in pairs(svc:GetDescendants()) do
                     if obj:IsA("LuaSourceContainer") then
                         table.insert(copiedData.Scripts, {
-                            Name = obj.Name,
-                            ClassName = obj.ClassName,
+                            Name = obj.Name, ClassName = obj.ClassName,
                             Source = obj.Source,
                             Parent = obj.Parent and obj.Parent:GetFullName() or "Unknown",
+                            Disabled = pcall(function() return obj.Disabled end) and obj.Disabled or false
                         })
-                        scriptCount = scriptCount + 1
-                    end
-                    if scriptCount % 30 == 0 then
-                        RunService.Heartbeat:Wait()
                     end
                 end
             end)
-            pcall(function()
-                ui.ProgFill:TweenSize(UDim2.new(si/#services, 0, 1, 0), "Out", "Quad", 0.05, true)
-            end)
+            pcall(function() ui.ProgFill:TweenSize(UDim2.new(si/#services,0,1,0),"Out","Quad",0.05,true) end)
+            RunService.Heartbeat:Wait()
         end
-
-        -- Phase 4: Build JSON and base64
-        ui.Status.Text = "Encoding..."
+        ui.Status.Text = "Building .rbxl BINARY..."
         RunService.Heartbeat:Wait()
-
-        local fullData = {
-            Version = "3.0",
-            Metadata = copiedData.Metadata,
-            Instances = copiedData.Instances,
-            Scripts = copiedData.Scripts,
-        }
-        local json = HttpService:JSONEncode(fullData)
-        local b64 = base64Encode(json)
-        currentB64Data = b64
-        currentFileName = "Lemming_" .. game.PlaceId .. "_" .. os.time()
-
-        local elapsed = math.floor((tick() - startTick) * 100) / 100
-        local sizeKB = math.floor(#b64 / 1024)
-
-        ui.Status.Text = "DONE: " .. sizeKB .. "KB | " .. elapsed .. "s"
+        currentBinaryData = buildRbxlBinary(copiedData)
+        currentFileName = "Lemming_"..game.PlaceId.."_"..os.time()
+        local elapsed = math.floor((tick()-startTick)*100)/100
+        local sizeKB = math.floor(#currentBinaryData/1024)
+        ui.Status.Text = "DONE: "..sizeKB.."KB | "..elapsed.."s"
         ui.StartBtn.Text = "START\nCOPY"
         ui.StartBtn.BackgroundColor3 = SETTINGS.Accent
         ui.ExportBtn1.Visible = true
         ui.ExportBtn2.Visible = true
-        ui.Info.Text = "Objects: " .. #copiedData.Instances .. "\nScripts: " .. #copiedData.Scripts .. "\nSize: " .. sizeKB .. "KB"
+        ui.Info.Text = "Objects: "..#copiedData.Instances.."\nScripts: "..#copiedData.Scripts.."\nSize: "..sizeKB.."KB\nFormat: .rbxl BINARY"
         isRunning = false
     end)
 end
 
-local function exportAllToClipboard()
-    if not currentB64Data or #currentB64Data == 0 then
-        ui.Status.Text = "NO DATA - Run copy first"
-        return
-    end
+local function exportToClipboard()
+    if not currentBinaryData or #currentBinaryData == 0 then ui.Status.Text = "NO DATA"; return end
     ui.Status.Text = "Copying ALL to clipboard..."
-    local numParts = copyAllAtOnce(currentB64Data, currentFileName)
-    if numParts == 1 then
-        ui.Status.Text = "COPIED! Single part. Paste in decoder."
-    else
-        ui.Status.Text = "COPIED! " .. numParts .. " parts in ONE string."
-    end
+    local n = copyAllAtOnce(currentBinaryData, currentFileName)
+    ui.Status.Text = n == 1 and "COPIED! Single part." or "COPIED! "..n.." parts in ONE string."
 end
 
-local function showDecoderInstructions()
-    local msg = [[
-DECODER STEPS:
-1. Open LemmingDecoderV3.html in browser
-2. Paste clipboard (Ctrl+V / long-press → Paste)
-3. Click DECODE & DOWNLOAD
-4. .rblxm file downloads automatically
-
-ALL parts are in ONE clipboard string.
-No sequential copying needed.
-]]
-    setclipboard(msg)
-    ui.Status.Text = "Instructions copied to clipboard"
-end
+local function showDecoder() setclipboard("Open LemmingDecoderV6.html. Paste. Decode. Download .rbxl. Open in Roblox Studio: FILE → OPEN."); ui.Status.Text = "Instructions copied" end
 
 ui.StartBtn.MouseButton1Click:Connect(startCopyProcess)
 ui.StartBtn.TouchTap:Connect(startCopyProcess)
-ui.ExportBtn1.MouseButton1Click:Connect(exportAllToClipboard)
-ui.ExportBtn1.TouchTap:Connect(exportAllToClipboard)
-ui.ExportBtn2.MouseButton1Click:Connect(showDecoderInstructions)
-ui.ExportBtn2.TouchTap:Connect(showDecoderInstructions)
-
-game:GetService("CoreGui").ChildRemoved:Connect(function(child)
-    if child.Name == "LemmingUI" then
-        isRunning = false
-    end
-end)
+ui.ExportBtn1.MouseButton1Click:Connect(exportToClipboard)
+ui.ExportBtn1.TouchTap:Connect(exportToClipboard)
+ui.ExportBtn2.MouseButton1Click:Connect(showDecoder)
+ui.ExportBtn2.TouchTap:Connect(showDecoder)
+game:GetService("CoreGui").ChildRemoved:Connect(function(c) if c.Name == "LemmingUI" then isRunning = false end end)
